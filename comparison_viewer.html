@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OCR 계약서 통합 검색 뷰어</title>
+    <style>
+        body { margin: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; display: flex; height: 100vh; background-color: #f5f6f8; color: #333; }
+        #sidebar { width: 350px; background-color: #ffffff; border-right: 1px solid #e0e2e5; display: flex; flex-direction: column; }
+        .search-box { padding: 20px; border-bottom: 1px solid #e0e2e5; background-color: #fcfdfe; }
+        #search-input { width: 100%; padding: 12px; border: 1px solid #ccd0d5; border-radius: 6px; box-sizing: border-box; font-size: 14px; }
+        #search-input:focus { border-color: #007aff; outline: none; }
+        
+        #doc-list { flex: 1; overflow-y: auto; padding: 10px; }
+        .doc-item { padding: 15px; margin-bottom: 8px; border-radius: 6px; border: 1px solid #eef0f2; background-color: #fff; cursor: pointer; transition: all 0.2s; border-left: 4px solid transparent; }
+        .doc-item:hover { background-color: #f0f7ff; border-color: #007aff; }
+        .doc-title { font-weight: 600; font-size: 14px; display: block; word-break: break-all; }
+        .doc-lang { font-size: 11px; color: #007aff; font-weight: bold; margin-top: 4px; display: inline-block; }
+        
+        #viewer-container { flex: 1; display: flex; flex-direction: row; background-color: #f5f6f8; }
+        .viewer-panel { flex: 1; display: flex; flex-direction: column; border-right: 1px solid #e0e2e5; background-color: #fff; margin: 15px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); overflow: hidden; }
+        .panel-header { padding: 15px; background-color: #fafbfc; border-bottom: 1px solid #e0e2e5; font-weight: bold; font-size: 15px; }
+        .panel-content { flex: 1; position: relative; overflow: auto; }
+        iframe, img { width: 100%; height: 100%; border: none; object-fit: contain; }
+        .no-doc { display: flex; justify-content: center; align-items: center; height: 100%; color: #8e949e; font-size: 15px; }
+    </style>
+</head>
+<body>
+
+    <div id="sidebar">
+        <div class="search-box">
+            <input type="text" id="search-input" placeholder="계약서 본문/파일명 검색 (Enter)" onkeyup="if(event.key==='Enter') searchDocs()">
+        </div>
+        <div id="doc-list">
+            <div class="no-doc">검색어를 입력해 주세요.</div>
+        </div>
+    </div>
+
+    <!-- 오른쪽 메인 뷰어 영역 (정밀 복구된 돔 구조) -->
+    <div id="viewer-container">
+        <!-- 1. 원본 파일 뷰어 패널 -->
+        <div class="viewer-panel">
+            <div class="panel-header" style="display: flex; justify-content: space-between; align-items: center;">
+                <span>📄 원본 문서 뷰어</span>
+                <div id="rename-zone" style="display: none; gap: 8px; align-items: center;">
+                    <input type="text" id="new-filename-input" style="padding: 6px 10px; border: 1px solid #ccd0d5; border-radius: 4px; width: 220px; font-size: 13px; outline: none;">
+                    <button onclick="submitRename()" style="padding: 6px 12px; background: #2e7d32; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: bold;">이름 변경</button>
+                </div>
+            </div>
+            <div class="panel-content" id="file-viewer-content">
+                <div class="no-doc">목록에서 문서를 선택해 주세요.</div>
+            </div>
+        </div>
+        
+        <!-- 2. OCR 텍스트 패널 (버튼 강제 노출 버전) -->
+        <div class="viewer-panel">
+            <div class="panel-header" style="display: flex; justify-content: space-between; align-items: center; background-color: #fafbfc; border-bottom: 1px solid #e0e2e5; padding: 15px;">
+                <span>🔍 OCR 추출 텍스트</span>
+                <!-- 💡 display: none을 제거하고 강제로 눈에 보이도록 스타일 수정 -->
+                <button onclick="submitOcrEdit()" id="ocr-save-btn" style="display: block; padding: 6px 14px; background-color: #007aff; color: #ffffff; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: bold; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">✓ OCR 내용 저장</button>
+            </div>
+            <div class="panel-content" style="display: flex; flex-direction: column; height: 100%;">
+                <textarea id="ocr-text-view" style="width: 100%; flex: 1; padding: 20px; border: none; resize: none; font-size: 14px; line-height: 1.6; font-family: 'Courier New', Courier, monospace; outline: none;" placeholder="문서를 선택하면 OCR 텍스트가 표시되며 수정이 활성화됩니다."></textarea>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentFileId = null;
+        let currentLocalPath = null;
+
+        window.addEventListener('DOMContentLoaded', () => { searchDocs(); });
+
+        String.prototype.strip = function() { return this.replace(/^\s+|\s+$/g, ""); };
+
+        function buildActualFilePath(dbLocalPath) {
+            if (!dbLocalPath || dbLocalPath.toLowerCase().includes('http')) return dbLocalPath;
+            const filename = dbLocalPath.split('/').pop();
+            return `/gdrive_downloads/${encodeURIComponent(filename)}`;
+        }
+
+        function searchDocs() {
+            const query = document.getElementById('search-input').value;
+            const docList = document.getElementById('doc-list');
+            
+            fetch(`/api/search?q=${encodeURIComponent(query)}`)
+                .then(res => res.json())
+                .then(data => {
+                    docList.innerHTML = '';
+                    if(!data.results || data.results.length === 0) {
+                        docList.innerHTML = '<div class="no-doc">검색 결과가 없습니다.</div>';
+                        return;
+                    }
+                    
+                    data.results.forEach(item => {
+                        const div = document.createElement('div');
+                        div.className = 'doc-item';
+                        div.id = `doc-${item.file_id}`;
+                        div.onclick = () => loadDocument(item.file_id, item.local_path);
+                        
+                        let displayName = item.local_path.split('/').pop();
+                        div.innerHTML = `<span class="doc-title">${displayName}</span><span class="doc-lang">[${item.language || 'KOR'}]</span>`;
+                        docList.appendChild(div);
+                    });
+                })
+                .catch(err => {
+                    console.error(err);
+                    docList.innerHTML = '<div class="no-doc" style="color:red;">서버 연결 실패</div>';
+                });
+        }
+
+        function loadDocument(fileId, localPath) {
+            currentFileId = fileId;
+            currentLocalPath = localPath;
+            
+            document.querySelectorAll('.doc-item').forEach(el => el.style.borderLeftColor = 'transparent');
+            const activeItem = document.getElementById(`doc-${fileId}`);
+            if(activeItem) activeItem.style.borderLeftColor = '#007aff';
+
+            const fileViewer = document.getElementById('file-viewer-content');
+            const fileUrl = buildActualFilePath(localPath);
+            const lowerPath = localPath.toLowerCase();
+            
+            if (lowerPath.includes('pdf')) {
+                fileViewer.innerHTML = `<iframe src="${fileUrl}"></iframe>`;
+            } else if (lowerPath.includes('jpg') || lowerPath.includes('jpeg') || lowerPath.includes('png')) {
+                fileViewer.innerHTML = `<img src="${fileUrl}" alt="원본 이미지">`;
+            } else {
+                fileViewer.innerHTML = `<img src="${fileUrl}" alt="원본 이미지 정밀 로드">`;
+            }
+
+            const ocrViewer = document.getElementById('ocr-text-view');
+            ocrViewer.value = "텍스트 읽는 중...";
+            
+            fetch(`/api/ocr-text?file_id=${encodeURIComponent(fileId)}`)
+                .then(res => res.json())
+                .then(data => {
+                    if (data.ocr_text) {
+                        ocrViewer.value = data.ocr_text;
+                    } else {
+                        ocrViewer.value = "추출된 OCR 텍스트가 없습니다.";
+                    }
+                });
+
+            const renameZone = document.getElementById('rename-zone');
+            const renameInput = document.getElementById('new-filename-input');
+            if (renameZone && renameInput) {
+                renameZone.style.display = 'flex';
+                renameInput.value = localPath.split('/').pop();
+            }
+        }
+
+        function submitRename() {
+            const renameInput = document.getElementById('new-filename-input');
+            if (!renameInput || !currentFileId) return;
+            
+            const newName = renameInput.value.strip();
+            if (!newName) return alert('변경할 파일 이름을 명확히 입력해 주세요.');
+            
+            if (!confirm(`정말로 이 이름으로 변경하시겠습니까?\n\n➔ ${newName}`)) return;
+            
+            fetch('/api/rename-file', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    file_id: currentFileId,
+                    new_name: newName
+                })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    alert('✨ 파일명과 DB 동기화가 완벽히 처리되었습니다!');
+                    searchDocs();
+                    setTimeout(() => {
+                        loadDocument(data.new_file_id, data.new_local_path);
+                    }, 350);
+                } else {
+                    alert(`⚠️ 이름 변경 실패: ${data.message}`);
+                }
+            })
+            .catch(err => {
+                console.error(err);
+                alert('서버 통신 오류가 발생했습니다.');
+            });
+        }
+
+        function submitOcrEdit() {
+            if (!currentFileId) return alert('선택된 문서가 없습니다.');
+            const ocrContent = document.getElementById('ocr-text-view').value;
+            
+            if (!confirm('현재 편집창의 내용으로 OCR 추출 텍스트를 저장하시겠습니까?')) return;
+            
+            fetch('/api/update-ocr', { 
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    file_id: currentFileId,
+                    ocr_text: ocrContent
+                })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success || data.status === "success") {
+                    alert('🎉 OCR 텍스트가 DB에 성공적으로 저장되었습니다!');
+                } else {
+                    alert(`⚠️ 저장 실패: ${data.message || '서버 에러 발생'}`);
+                }
+            })
+            .catch(err => {
+                console.error(err);
+                alert('서버와 통신 중 오류가 발생했습니다.');
+            });
+        }
+    </script>
+</body>
+</html>
